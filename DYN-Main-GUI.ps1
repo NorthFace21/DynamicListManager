@@ -26,9 +26,14 @@ Add-Type -AssemblyName System.Drawing
 # ==========================================
 # PATH HUNTER
 # ==========================================
+$InvocationParent = $null
+if ($MyInvocation -and $MyInvocation.MyCommand -and $MyInvocation.MyCommand.Path) {
+    $InvocationParent = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+
 $PossiblePaths = @(
     $PSScriptRoot,
-    (Split-Path -Parent $MyInvocation.MyCommand.Path),
+    $InvocationParent,
     (Get-Location).Path
 )
 
@@ -46,7 +51,42 @@ if (-not $ScriptDir) { $ScriptDir = (Get-Location).Path }
 # ==========================================
 $EngineScript = Join-Path $ScriptDir "DYN-UpdateEngine.ps1"
 $script:EngineProcess = $null
-$ScriptHost = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+$ScriptHost = if (Get-Command powershell.exe -ErrorAction SilentlyContinue) {
+    "powershell.exe"
+} elseif (Get-Command powershell -ErrorAction SilentlyContinue) {
+    "powershell"
+} elseif (Get-Command pwsh.exe -ErrorAction SilentlyContinue) {
+    "pwsh.exe"
+} else {
+    "pwsh"
+}
+
+function Start-GuiScriptFallback {
+    param(
+        [Parameter(Mandatory=$true)][string]$ScriptPath,
+        [Parameter(Mandatory=$true)][string]$WorkingDirectory
+    )
+
+    $HostsToTry = @("powershell.exe", "pwsh.exe", "powershell", "pwsh")
+    $Errors = New-Object System.Collections.Generic.List[string]
+
+    foreach ($Host in $HostsToTry) {
+        try {
+            if (-not (Get-Command $Host -ErrorAction SilentlyContinue)) { continue }
+
+            Start-Process -FilePath $Host -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-File", $ScriptPath) -WindowStyle Normal -WorkingDirectory $WorkingDirectory
+            return $true
+        } catch {
+            $Errors.Add("${Host}: $($_.Exception.Message)") | Out-Null
+        }
+    }
+
+    if ($Errors.Count -gt 0) {
+        throw "All fallback hosts failed:`n$($Errors -join "`n")"
+    }
+
+    throw "No PowerShell host was found for fallback launch."
+}
 
 $Tools = @{
     "01" = @{ Title="Attribute Manager"; File="DYN-AttributeManager-GUI.ps1"; Color="Goldenrod";      Desc="Map AD Attributes to SQL" }
@@ -155,26 +195,8 @@ $CardClickHandler = {
         $FileName = [System.IO.Path]::GetFileName($Path)
         $StatusMain.Text = "Launching: $FileName"
 
-        if ($FileName -eq "DYN-AttributeManager-GUI.ps1") {
-            try {
-                . $Path
-                if (-not (Get-Command New-AttributeManagerForm -ErrorAction SilentlyContinue)) {
-                    throw "New-AttributeManagerForm function was not found after loading script."
-                }
-
-                $ChildForm = New-AttributeManagerForm
-                $ChildForm.StartPosition = "CenterParent"
-                [void]$ChildForm.ShowDialog($Form)
-            } catch {
-                [System.Windows.Forms.MessageBox]::Show("Attribute Manager launch failed:`n$($_.Exception.Message)", "Error", 0, 16)
-            }
-            return
-        }
-
         try {
-            $SafePath = $Path.Replace("'", "''")
-            $Cmd = "& ([ScriptBlock]::Create((Get-Content -LiteralPath '$SafePath' -Raw -Encoding UTF8)))"
-            Start-Process -FilePath $ScriptHost -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-Command", $Cmd) -WindowStyle Hidden -WorkingDirectory $ScriptDir
+            Start-Process -FilePath $ScriptHost -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-File", $Path) -WindowStyle Hidden -WorkingDirectory $ScriptDir
         } catch {
             [System.Windows.Forms.MessageBox]::Show("Tool launch failed:`n$($_.Exception.Message)", "Error", 0, 16)
         }

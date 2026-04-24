@@ -14,8 +14,8 @@ Add-Type -AssemblyName System.Drawing
 # ==========================================
 # CONFIGURATION
 # ==========================================
-$SqlInstance = "SQL16-DIVERS" 
-$Database    = "DBTEST"      
+$SqlInstance = if ($env:DYN_SQL_INSTANCE) { $env:DYN_SQL_INSTANCE } else { "SQL16-DIVERS" }
+$Database    = if ($env:DYN_SQL_DATABASE) { $env:DYN_SQL_DATABASE } else { "DBTEST" }
 # ==========================================
 
 # --- SQL HELPER ---
@@ -23,14 +23,16 @@ function Invoke-Sql {
     param($Query, $ReturnScalar=$false)
     
     $ResultInfo = @{ Success = $false; Data = $null; Message = "" }
+    $Conn = $null
 
     try {
-        $ConnString = "Server=$SqlInstance;Database=$Database;Integrated Security=True;"
+        $ConnString = "Server=$SqlInstance;Database=$Database;Integrated Security=True;Connect Timeout=5;"
         $Conn = New-Object System.Data.SqlClient.SqlConnection($ConnString)
         $Conn.Open()
         
         $Cmd = $Conn.CreateCommand()
         $Cmd.CommandText = $Query
+        $Cmd.CommandTimeout = 10
         
         if ($ReturnScalar) {
             $ResultInfo.Data = $Cmd.ExecuteScalar()
@@ -38,19 +40,30 @@ function Invoke-Sql {
             $Adapter = New-Object System.Data.SqlClient.SqlDataAdapter $Cmd
             $DS = New-Object System.Data.DataSet
             $Adapter.Fill($DS) | Out-Null
-            $ResultInfo.Data = $DS.Tables[0]
+            if ($DS.Tables.Count -gt 0) {
+                $ResultInfo.Data = $DS.Tables[0]
+            } else {
+                $ResultInfo.Data = New-Object System.Data.DataTable
+            }
         }
-        $Conn.Close()
         $ResultInfo.Success = $true
     }
     catch {
-        $ResultInfo.Message = $_.Exception.Message
+        $ResultInfo.Message = "Server=$SqlInstance; Database=$Database; Error=$($_.Exception.Message)"
+    }
+    finally {
+        if ($Conn) {
+            $Conn.Close()
+            $Conn.Dispose()
+        }
     }
     
     return $ResultInfo
 }
 
 function New-AttributeManagerForm {
+    $InvokeSqlFn = ${function:Invoke-Sql}.GetNewClosure()
+
     $Form = New-Object System.Windows.Forms.Form
     $Form.Text = "AD Attribute Mapper"
     $Form.Size = New-Object System.Drawing.Size(560, 650)
@@ -59,7 +72,7 @@ function New-AttributeManagerForm {
     # 1. STATUS STRIP (Bottom Bar)
     $StatusStrip = New-Object System.Windows.Forms.StatusStrip
     $StatusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
-    $StatusLabel.Text = "Ready"
+    $StatusLabel.Text = "Ready - Server: $SqlInstance / DB: $Database"
     $StatusStrip.Items.Add($StatusLabel)
     $Form.Controls.Add($StatusStrip)
 
@@ -156,29 +169,46 @@ function New-AttributeManagerForm {
     $Grid.AutoSizeColumnsMode = "Fill"
     $Form.Controls.Add($Grid)
 
-    function Set-Status {
+    $DoSetStatus = {
         param($Msg, $IsError=$false)
         $StatusLabel.Text = "[$([DateTime]::Now.ToString('HH:mm:ss'))] $Msg"
         if ($IsError) { $StatusLabel.ForeColor = "Red" } else { $StatusLabel.ForeColor = "Black" }
-    }
+    }.GetNewClosure()
 
-    function Refresh-Grid {
-        Set-Status "Querying Database..."
+    $DoRefreshGrid = {
+        $null = $DoSetStatus.Invoke("Querying Database...", $false)
         $Grid.DataSource = $null
-        $Res = Invoke-Sql "SELECT AttrID, FriendlyName, ADAttribute, DataType FROM Sys_AttributeMap"
+        $Res = $InvokeSqlFn.Invoke("SELECT AttrID, FriendlyName, ADAttribute, DataType FROM Sys_AttributeMap", $false)
 
         if ($Res.Success) {
             $Grid.DataSource = $Res.Data
             if ($Grid.Columns["AttrID"]) { $Grid.Columns["AttrID"].Visible = $false }
 
             $Count = if ($Res.Data) { $Res.Data.Rows.Count } else { 0 }
-            Set-Status "Connected. Rows Loaded: $Count"
+            if ($Count -eq 0) {
+                $null = $DoSetStatus.Invoke("Connected. Rows Loaded: 0 (table currently empty)", $false)
+            } else {
+                $null = $DoSetStatus.Invoke("Connected. Rows Loaded: $Count", $false)
+            }
         } else {
-            Set-Status "Error: $($Res.Message)" $true
-        }
-    }
+            $null = $DoSetStatus.Invoke("Error: $($Res.Message)", $true)
+            [System.Windows.Forms.MessageBox]::Show(
+                "Failed to load attribute data from SQL.`n`nServer: $SqlInstance`nDatabase: $Database`n`nError:`n$($Res.Message)",
+                "SQL Load Error",
+                0,
+                16
+            ) | Out-Null
 
-    function Clear-Form {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Tip: You can override SQL target without editing code by setting environment variables before launching:`n`nDYN_SQL_INSTANCE=your-server-or-server\instance`nDYN_SQL_DATABASE=your-database",
+                "SQL Connection Tip",
+                0,
+                64
+            ) | Out-Null
+        }
+    }.GetNewClosure()
+
+    $DoClearForm = {
         $TxtID.Text = ""
         $TxtFriendly.Text = ""
         $TxtAD.Text = ""
@@ -187,38 +217,53 @@ function New-AttributeManagerForm {
         $BtnUpdate.Enabled = $false
         $BtnDelete.Enabled = $false
         $Grid.ClearSelection()
-    }
+    }.GetNewClosure()
 
-    $BtnAdd.Add_Click({
+    $BtnAdd.Add_Click(({
         if ($TxtFriendly.Text -and $TxtAD.Text) {
             $Q = "INSERT INTO Sys_AttributeMap (FriendlyName, ADAttribute, DataType) VALUES ('$($TxtFriendly.Text)', '$($TxtAD.Text)', '$($CmbType.SelectedItem)')"
-            $Res = Invoke-Sql $Q
-            if ($Res.Success) { Refresh-Grid; Clear-Form } else { Set-Status "Insert Failed: $($Res.Message)" $true }
+            $Res = $InvokeSqlFn.Invoke($Q, $false)
+            if ($Res.Success) {
+                $null = $DoRefreshGrid.Invoke()
+                $null = $DoClearForm.Invoke()
+            } else {
+                $null = $DoSetStatus.Invoke("Insert Failed: $($Res.Message)", $true)
+            }
         }
-    })
+    }).GetNewClosure())
 
-    $BtnUpdate.Add_Click({
+    $BtnUpdate.Add_Click(({
         if ($TxtID.Text) {
             $Q = "UPDATE Sys_AttributeMap SET FriendlyName='$($TxtFriendly.Text)', ADAttribute='$($TxtAD.Text)', DataType='$($CmbType.SelectedItem)' WHERE AttrID=$($TxtID.Text)"
-            $Res = Invoke-Sql $Q
-            if ($Res.Success) { Refresh-Grid; Clear-Form } else { Set-Status "Update Failed: $($Res.Message)" $true }
+            $Res = $InvokeSqlFn.Invoke($Q, $false)
+            if ($Res.Success) {
+                $null = $DoRefreshGrid.Invoke()
+                $null = $DoClearForm.Invoke()
+            } else {
+                $null = $DoSetStatus.Invoke("Update Failed: $($Res.Message)", $true)
+            }
         }
-    })
+    }).GetNewClosure())
 
-    $BtnDelete.Add_Click({
+    $BtnDelete.Add_Click(({
         if ($TxtID.Text) {
             if ([System.Windows.Forms.MessageBox]::Show("Delete this mapping?", "Confirm", "YesNo") -eq "Yes") {
                 $Q = "DELETE FROM Sys_AttributeMap WHERE AttrID=$($TxtID.Text)"
-                $Res = Invoke-Sql $Q
-                if ($Res.Success) { Refresh-Grid; Clear-Form } else { Set-Status "Delete Failed: $($Res.Message)" $true }
+                $Res = $InvokeSqlFn.Invoke($Q, $false)
+                if ($Res.Success) {
+                    $null = $DoRefreshGrid.Invoke()
+                    $null = $DoClearForm.Invoke()
+                } else {
+                    $null = $DoSetStatus.Invoke("Delete Failed: $($Res.Message)", $true)
+                }
             }
         }
-    })
+    }).GetNewClosure())
 
-    $BtnClear.Add_Click({ Clear-Form })
-    $BtnRefresh.Add_Click({ Refresh-Grid })
+    $BtnClear.Add_Click(({ $null = $DoClearForm.Invoke() }).GetNewClosure())
+    $BtnRefresh.Add_Click(({ $null = $DoRefreshGrid.Invoke() }).GetNewClosure())
 
-    $Grid.Add_CellClick({
+    $Grid.Add_CellClick(({
         if ($Grid.SelectedRows.Count -gt 0) {
             $Row = $Grid.SelectedRows[0]
             $TxtID.Text = $Row.Cells["AttrID"].Value
@@ -230,9 +275,9 @@ function New-AttributeManagerForm {
             $BtnUpdate.Enabled = $true
             $BtnDelete.Enabled = $true
         }
-    })
+    }).GetNewClosure())
 
-    $Form.Add_Load({ Refresh-Grid })
+    $Form.Add_Load(({ $null = $DoRefreshGrid.Invoke() }).GetNewClosure())
     return $Form
 }
 
